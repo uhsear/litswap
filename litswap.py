@@ -961,6 +961,15 @@ def self_test():
     check(f[0].context == 'x = "Db.SCHEMA.A"',
           "the context beside a finding is stripped of its indentation")
 
+    # The front end tokenizes and never parses, so a Python 2 file is scanned
+    # like any other. Measured on a 743-file legacy tree: 736 files scanned,
+    # 335 of them files that Python 3 refuses to ast.parse.
+    py2 = 'print "starting"\nsrv = "OLDHOST"\n'
+    f = scan_source(py2, host)
+    check(kinds(f) == [REPLACE] and f[0].lineno == 2,
+          "a Python 2 print statement does not stop the scan, because the "
+          "front end tokenizes and never parses  <-- pinned defect")
+
     # ---- a source the tokenizer refuses is an error, never a partial answer
     raises(lambda: literal_spans('sql = """unterminated\n'),
            "an unterminated triple quote raises  <-- pinned defect")

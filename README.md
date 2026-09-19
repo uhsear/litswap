@@ -29,6 +29,7 @@ PASS  a quote inside a comment is comment, not a second literal
 PASS  an f-string is ONE span on every Python version  <-- pinned defect
 PASS  and that span STARTS at the outer f-string, not at the inner one  <-- pinned defect
 PASS  findings come out in line then column order whichever rule found them, which is the order the report prints and --apply walks  <-- pinned defect
+PASS  a Python 2 print statement does not stop the scan, because the front end tokenizes and never parses  <-- pinned defect
 PASS  an unterminated triple quote raises  <-- pinned defect
 PASS  scan_source raises rather than scanning a partial mask  <-- pinned defect
 PASS  the casing the script wrote is kept, not the casing on the command line  <-- pinned defect
@@ -72,13 +73,13 @@ PASS  and --ext txt scans and rewrites the same file  <-- pinned defect
 ...
 PASS  the self-test leaves no temporary directory behind  <-- pinned defect
 --------------------------------------------------------------------
-167 assertions, 0 failed
+168 assertions, 0 failed
 ```
 
 ## Requirements
 
 Python 3.9 or newer. Nothing to install, no `arcpy`, no third-party package. It runs on ArcGIS Pro's
-Python and on a plain `python3` equally. The same 167 assertions pass on Windows and on Linux.
+Python and on a plain `python3` equally. The same 168 assertions pass on Windows and on Linux.
 
 ```
 git clone https://github.com/uhsear/litswap.git
@@ -217,6 +218,19 @@ ArcGIS Pro's Python and on a current `python3`.
 A file the tokenizer refuses is an ERROR with no findings, never a partial answer. A partial answer
 is worse than none: it names a few hits, implies the rest of the file is clean, and the operator
 moves on.
+
+Tokenizing rather than parsing is also why this works on an old tree, and the measurement says where
+it stops. On a 743-file ArcGIS automation estate written between 2010 and 2019, 340 files of which do
+not parse under Python 3, litswap refused 7 files and scanned the other 736; renaming one path
+literal that tree uses everywhere gave 1,461 replacements across 249 files, and 355 of those
+replacements are in 93 files no Python 3 parser can read. The 7 refusals are not Python 2 files:
+5 defeat the tokenizer itself with a bad dedent or an unterminated statement, and 2 are not valid
+UTF-8. The boundary is the encoding and the damage, not the Python version. The same tree marks the
+other edge of the tool, the one to know before you reach for it: litswap never asks whether a path
+exists. That tree holds 265 distinct drive-letter and UNC path literals, and not one of them resolves
+on the workstation that ran the scan, which is a fact about that workstation and not about those
+paths. Renaming a literal is a text decision and litswap makes it. Deciding whether a path is stale
+needs the machine that owns the path, and this tool will not guess for you.
 
 ## Writing
 
