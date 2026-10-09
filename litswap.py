@@ -1240,6 +1240,15 @@ def self_test():
     check(exits == [2],
           "a --rename with no equals sign exits 2, the code the README "
           "documents for a rejected flag value  <-- pinned defect")
+    # allow_abbrev=False: a unique prefix of --apply must not write.
+    prefix_exits = []
+    try:
+        capture(lambda: _parse(["x", "--ap"]))
+    except SystemExit as exc:
+        prefix_exits.append(exc.code)
+    check(prefix_exits == [2],
+          "a unique prefix of the write flag (--ap for --apply) is refused "
+          "by the parser, not taken as --apply  <-- pinned defect")
 
     # ---- the file layer
     tmp = tempfile.mkdtemp(prefix="litswap-selftest-")
@@ -1623,6 +1632,7 @@ def _parse(argv):
                     "scripts, and report every case the rules cannot decide.",
         epilog="Nothing is written without --apply, and every file written is "
                "backed up first.",
+        allow_abbrev=False,
     )
     ap.add_argument("paths", nargs="*",
                     help="files or directories to scan")

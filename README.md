@@ -53,6 +53,7 @@ PASS  the same object still written in full elsewhere makes it strong  <-- pinne
 PASS  a bare file name excludes that file anywhere in the walk, not only at the top of it  <-- pinned defect
 PASS  --apply is OFF unless asked for  <-- pinned defect
 PASS  a --rename with no equals sign exits 2, the code the README documents for a rejected flag value  <-- pinned defect
+PASS  a unique prefix of the write flag (--ap for --apply) is refused by the parser, not taken as --apply  <-- pinned defect
 ...
 PASS  __pycache__ and a dotted directory are never descended into  <-- pinned defect
 PASS  --ext takes an extension with or without its leading dot  <-- pinned defect
@@ -73,13 +74,13 @@ PASS  and --ext txt scans and rewrites the same file  <-- pinned defect
 ...
 PASS  the self-test leaves no temporary directory behind  <-- pinned defect
 --------------------------------------------------------------------
-168 assertions, 0 failed
+169 assertions, 0 failed
 ```
 
 ## Requirements
 
 Python 3.9 or newer. Nothing to install, no `arcpy`, no third-party package. It runs on ArcGIS Pro's
-Python and on a plain `python3` equally. The same 168 assertions pass on Windows and on Linux.
+Python and on a plain `python3` equally. The same 169 assertions pass on Windows and on Linux.
 
 ```
 git clone https://github.com/uhsear/litswap.git
