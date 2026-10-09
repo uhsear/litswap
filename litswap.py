@@ -389,10 +389,10 @@ def _scan_strip(source, rules, strings, comments, place, findings):
         if span_at(comments, pos) is not None:
             continue
         if span_at(strings, pos) is None:
-            # Kept for symmetry with the static pass and not reachable from any
-            # source this tool will read: a qualifier with a trailing dot and no
-            # object name after it is not valid Python outside a literal, so a
-            # file containing one in code never gets past the tokenizer.
+            # Reached only by code that tokenizes but cannot parse, such as
+            # "x = Db.SDE.(1)": the tokenizer never parses, so it lets that
+            # through. A line that cannot run names no object to repoint, so
+            # it is left out of the report. The self-test pins this.
             continue
         if not _left_boundary(source, pos):
             continue
@@ -669,6 +669,8 @@ def write_atomic(path, data):
     except Exception:
         if handle is not None:
             os.close(handle)
+        # ponytail: the False branch needs os.replace to consume the temporary
+        # file and then raise, which no offline fixture can make happen.
         if os.path.exists(temp):
             os.remove(temp)
         raise
@@ -970,6 +972,38 @@ def self_test():
           "a Python 2 print statement does not stop the scan, because the "
           "front end tokenizes and never parses  <-- pinned defect")
 
+    # ---- a path literal is text, never a liveness verdict
+    # A drive letter belongs to one logon session, so a path that is missing
+    # at the desk running the scan can be present for the account running the
+    # job. The scan must decide without asking, so every file-system lookup is
+    # wrapped here and the scan must make none of them.
+    paths_src = ('a = r"Q:\\gis\\OLDHOST\\parcels.gdb"\n'
+                 'b = r"\\\\OLDHOST\\share\\roads.gdb"\n')
+    calls = []
+    probes = [(os, "stat"), (os, "lstat"), (os, "listdir"), (os, "scandir"),
+              (os, "access"), (os.path, "exists"), (os.path, "lexists"),
+              (os.path, "isdir"), (os.path, "isfile")]
+    held_fs = [(mod, name, getattr(mod, name)) for mod, name in probes]
+    for mod, name, fn in held_fs:
+        setattr(mod, name, lambda *a, _n=name, _f=fn, **k:
+                (calls.append(_n), _f(*a, **k))[1])
+    try:
+        f = scan_source(paths_src, host)
+        scan_calls = list(calls)
+        os.path.exists(os.curdir)
+    finally:
+        for mod, name, fn in held_fs:
+            setattr(mod, name, fn)
+    check(calls[:1] == ["exists"],
+          "the file-system probe is live: a lookup made under it is recorded  "
+          "<-- pinned defect")
+    check(scan_calls == [],
+          "a drive-letter and a UNC literal are decided with no file-system "
+          "call, so the scan never calls a path DEAD  <-- pinned defect")
+    check(kinds(f) == [REPLACE, REPLACE],
+          "and each is a replacement like any other literal, whether or not "
+          "it resolves on this machine")
+
     # ---- a source the tokenizer refuses is an error, never a partial answer
     raises(lambda: literal_spans('sql = """unterminated\n'),
            "an unterminated triple quote raises  <-- pinned defect")
@@ -1058,6 +1092,9 @@ def self_test():
           "a computed qualifier written in a comment is left alone")
     check(scan_source('fc = "xDb.SDE." + name\n', strip) == [],
           "and one running on from the word before it is not reported either")
+    check(scan_source("x = Db.SDE.(1)\n", strip) == [],
+          "a computed qualifier in code that tokenizes but cannot parse is "
+          "left out, because that line names no object to repoint")
 
     # ---- rename rules: the whole-value cases
     f = scan_source('srv = "OLDHOST"\n', host)
@@ -1356,6 +1393,8 @@ def self_test():
         stamped = write("stamped.py", b'srv = "OLDHOST"\n')
         open(stamped + ".bak", "wb").close()
         nxt = ""
+        # ponytail: the retry and the loop running out are taken only when the
+        # clock ticks over a second mid-loop, so a run covers them by chance.
         for _ in range(3):
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
             open("%s.%s.bak" % (stamped, stamp), "wb").close()
@@ -1543,6 +1582,17 @@ def self_test():
               == b'srv = "newhost.example.org"\n',
               "with the work really done")
 
+        # a drive-letter path no machine here resolves, end to end
+        drive_dir = os.path.join(tmp, "drive")
+        write("drive/a.py", b'gdb = r"Q:\\gis\\OLDHOST\\parcels.gdb"\n')
+        code, out = capture(lambda: main([drive_dir, "--rename",
+                                          "OLDHOST=newhost.example.org"]))
+        check(code == 1 and "1 replacement(s) pending" in out
+              and not any(word in out.replace(tmp, "").upper() for word in
+                          ("DEAD", "MISSING", "UNVERIFIABLE", "NOT FOUND")),
+              "the report on a drive-letter literal gives a rename decision "
+              "and no path verdict at all  <-- pinned defect")
+
         # the strip rule end to end
         strip_dir = os.path.join(tmp, "strip")
         target = write("strip/a.py",
@@ -1606,6 +1656,8 @@ def self_test():
 
     print("-" * 68)
     total = passed[0] + len(failed)
+    # ponytail: this branch runs only on a red self-test, so a green coverage
+    # run cannot reach it. The harness probes above prove failures are recorded.
     if failed:
         print("%d assertions, %d failed" % (total, len(failed)))
         for label in failed:
@@ -1727,5 +1779,6 @@ def main(argv=None):
     return 0
 
 
+# ponytail: the False branch is an import, and the coverage run is a script run.
 if __name__ == "__main__":
     sys.exit(main())

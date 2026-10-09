@@ -30,6 +30,8 @@ PASS  an f-string is ONE span on every Python version  <-- pinned defect
 PASS  and that span STARTS at the outer f-string, not at the inner one  <-- pinned defect
 PASS  findings come out in line then column order whichever rule found them, which is the order the report prints and --apply walks  <-- pinned defect
 PASS  a Python 2 print statement does not stop the scan, because the front end tokenizes and never parses  <-- pinned defect
+PASS  the file-system probe is live: a lookup made under it is recorded  <-- pinned defect
+PASS  a drive-letter and a UNC literal are decided with no file-system call, so the scan never calls a path DEAD  <-- pinned defect
 PASS  an unterminated triple quote raises  <-- pinned defect
 PASS  scan_source raises rather than scanning a partial mask  <-- pinned defect
 PASS  the casing the script wrote is kept, not the casing on the command line  <-- pinned defect
@@ -72,15 +74,17 @@ PASS  a weak hint warns and carries on, so nobody reaches for --force by habit  
 PASS  and --force really does let that write through  <-- pinned defect
 PASS  and --ext txt scans and rewrites the same file  <-- pinned defect
 ...
+PASS  the report on a drive-letter literal gives a rename decision and no path verdict at all  <-- pinned defect
+...
 PASS  the self-test leaves no temporary directory behind  <-- pinned defect
 --------------------------------------------------------------------
-169 assertions, 0 failed
+174 assertions, 0 failed
 ```
 
 ## Requirements
 
 Python 3.9 or newer. Nothing to install, no `arcpy`, no third-party package. It runs on ArcGIS Pro's
-Python and on a plain `python3` equally. The same 169 assertions pass on Windows and on Linux.
+Python and on a plain `python3` equally. The same 174 assertions pass on Windows and on Linux.
 
 ```
 git clone https://github.com/uhsear/litswap.git
@@ -233,6 +237,25 @@ on the workstation that ran the scan, which is a fact about that workstation and
 paths. Renaming a literal is a text decision and litswap makes it. Deciding whether a path is stale
 needs the machine that owns the path, and this tool will not guess for you.
 
+### A path that does not resolve here is UNVERIFIABLE, not DEAD
+
+When you check those path literals yourself before a rename, a path that does not resolve on your
+workstation is UNVERIFIABLE, not DEAD. Microsoft documents that drive letters are not global to the
+system: each logon session gets its own set from A to Z, and a process in one logon session cannot
+see the drive letters made in another
+([Services and Redirected Drives](https://learn.microsoft.com/en-us/windows/win32/services/services-and-redirected-drives)).
+So `Q:\gis\parcels.gdb` can be missing at your desk and present for the account that runs the job,
+on the server that runs it. A local disk letter such as `D:` names a disk on the job's own machine,
+not on yours. Only a check made on that machine, as that account, can call the path DEAD. The same
+page tells a service to use the UNC name instead of a mapped drive letter.
+
+litswap gives no path a liveness verdict, so it cannot make this mistake. The self-test pins that.
+It wraps nine file-system lookups: `os.stat`, `os.lstat`, `os.listdir`, `os.scandir`, `os.access`,
+and `exists`, `lexists`, `isdir` and `isfile` from `os.path`. It proves the wrapper records a real
+lookup. Then it scans a drive-letter literal and a UNC literal: the scan makes none of those lookups
+and replaces both. A full run over a drive-letter literal prints a rename decision, and its report
+holds none of the words DEAD, MISSING, UNVERIFIABLE or NOT FOUND.
+
 ## Writing
 
 - The dry run writes nothing. `--apply` is the only thing that writes, and no environment variable
@@ -278,6 +301,11 @@ for that window. Run the dry run as early and as often as you like. It only read
   originals. Remove them yourself when the change is confirmed.
 - It does not rename identifiers, imports, attributes or anything else a refactoring tool renames.
   That work belongs to `rope` or `libcst`, which do it properly.
+- The self-test reaches 99% branch coverage, not 100%. Five branches cannot be reached by a green
+  offline run, and each one carries a `ponytail:` comment in the code. The red-run report and the
+  `__main__` import branch need a failed run or an import. The backup-name retry and the end of its
+  loop need the clock to tick over a second inside the loop. The atomic write's cleanup branch needs
+  `os.replace` to consume the temporary file and then raise.
 
 ## Why not sed, or a refactoring tool
 
