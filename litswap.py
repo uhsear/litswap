@@ -36,10 +36,12 @@ error.
 from __future__ import print_function
 
 import argparse
+import ast
 import fnmatch
 import io
 import os
 import re
+import runpy
 import shutil
 import sys
 import tempfile
@@ -85,7 +87,21 @@ CONTEXT_WIDTH = 110
 REPLACE = "REPLACE"
 REVIEW = "REVIEW"
 
+_FIELD_NOTE = ("inside an f-string replacement field, which is code and not "
+               "this tool's to edit")
+
 _SQL_RE = re.compile(r"\b(?:%s)\b" % "|".join(SQL_KEYWORDS), re.IGNORECASE)
+
+# The report echoes the source line beside every finding, and a connection
+# string often keeps its password on the same line as the host being renamed.
+# These two shapes are masked in the echo only; the file on disk is never
+# touched by them. ponytail: shortcut: only PWD/PASSWORD/SECRET/TOKEN/KEY
+# assignments and user:password@ URLs are masked, so review a log before
+# sharing it; widen the list when a new shape turns up.
+_SECRET_RE = re.compile(
+    r"(\b(?:pwd|password|passwd|pass|secret|token|apikey|api_key|key)"
+    r"\s*[=:]\s*)(?:\"[^\"]*\"|'[^']*'|[^;\s\"',)]+)", re.IGNORECASE)
+_URL_SECRET_RE = re.compile(r"(://[^/\s:@\"']+:)[^@/\s\"']+@")
 
 
 class ScanError(ValueError):
@@ -137,6 +153,11 @@ class Rules(object):
                 raise ValueError("a rename needs a non-empty old value")
             if old == new:
                 raise ValueError("rename %r to itself does nothing" % old)
+            if not new:
+                # An unset shell variable in --rename "OLD=$NEW" lands here.
+                # Writing an empty literal over every hit is never the intent.
+                raise ValueError("rename %r to an empty value would blank "
+                                 "every literal it touches" % old)
             self.renames.append((old, new, re.compile(re.escape(old),
                                                       re.IGNORECASE)))
 
@@ -212,10 +233,15 @@ def line_for_offset(offsets, pos):
 
 
 def context_for(source, offsets, lineno):
-    """The source line holding a finding, stripped and truncated."""
+    """The source line holding a finding, secrets masked, stripped, truncated.
+
+    Masking runs before truncation, so a cut can never leave half a password.
+    """
     start = offsets[lineno - 1]
     end = offsets[lineno] - 1 if lineno < len(offsets) else len(source)
-    return source[start:end].strip()[:CONTEXT_WIDTH]
+    line = _SECRET_RE.sub(r"\1***", source[start:end])
+    line = _URL_SECRET_RE.sub(r"\1***@", line)
+    return line.strip()[:CONTEXT_WIDTH]
 
 
 def literal_spans(source):
@@ -233,6 +259,12 @@ def literal_spans(source):
     python3, which is the whole point of asking the tokenizer instead of
     guessing.
     """
+    if re.search("\r(?!\n)", source):
+        # Line numbers and columns here count LF only. A bare CR (old Mac) is a
+        # line break to the tokenizer and not to this count, so every position
+        # would drift. Refuse the file in the scan, where the report shows it.
+        raise ScanError("a bare CR line ending (old Mac) is not supported, so "
+                        "it was not scanned. Convert the file to LF or CRLF.")
     offsets = line_offsets(source)
     strings = []
     comments = []
@@ -327,6 +359,90 @@ def _literal_text(source, span):
     return source[span[0]:span[1]].rstrip("\"'").rstrip()
 
 
+def _literal_shape(source, span):
+    """(prefix, quote, body_start, body_end) of one literal, as offsets.
+
+    The prefix is lower-cased and holds the r, b, f and u letters. The body
+    excludes the opening and closing quotes, which are one or three characters.
+    """
+    text = source[span[0]:span[1]]
+    cut = min(i for i in (text.find('"'), text.find("'")) if i >= 0)
+    quote = text[cut]
+    width = 3 if (text[cut:cut + 3] == quote * 3
+                  and len(text) - cut >= 6) else 1
+    return (text[:cut].lower(), quote, span[0] + cut + width,
+            span[1] - width)
+
+
+def _fstring_fields(source, span):
+    """The replacement fields of an f-string literal, as (start, end) offsets.
+
+    Text inside {...} is code, not data. {{ and }} are literal braces, and
+    \\N{NAME} is an escape in a non-raw literal. Braces are counted without
+    reading the quotes inside a field, so a field that holds a quoted brace is
+    cut short. ponytail: shortcut: that case is rare, and a cut-short field
+    only makes a later hit look like data, so upgrade to a real parse then.
+    """
+    prefix, _quote, i, end = _literal_shape(source, span)
+    raw = "r" in prefix
+    fields = []
+    while i < end:
+        c = source[i]
+        if c == "\\" and not raw:
+            if source.startswith("N{", i + 1):
+                i = max(source.find("}", i), i) + 1
+            else:
+                i += 1 if source[i + 1:i + 2] in ("{", "}") else 2
+        elif c == "{" and source.startswith("{{", i):
+            i += 2
+        elif c == "{":
+            depth, j = 1, i + 1
+            while j < end and depth:
+                if source[j] == "{":
+                    depth += 1
+                elif source[j] == "}":
+                    depth -= 1
+                j += 1
+            fields.append((i, j))
+            i = j
+        elif c == "}":
+            i += 2 if source.startswith("}}", i) else 1
+        else:
+            i += 1
+    return fields
+
+
+def _in_code_field(source, span, pos):
+    """True when pos sits inside a replacement field of an f-string."""
+    if "f" not in _literal_shape(source, span)[0]:
+        return False
+    return any(a <= pos < b for a, b in _fstring_fields(source, span))
+
+
+def _fit_new(source, span, new):
+    """`new` as it must be written inside this literal, or None if it cannot.
+
+    The new value goes into the file as source text, so a backslash, the quote
+    character, a line break or a brace in an f-string has to be escaped for the
+    literal it lands in, or the file stops compiling or quietly holds a
+    different value. A raw literal cannot hold a quote or end in a backslash,
+    and a bytes literal cannot hold a non-ASCII character, so those are None.
+    """
+    prefix, quote = _literal_shape(source, span)[:2]
+    if "b" in prefix and any(ord(c) > 127 for c in new):
+        return None
+    if "r" in prefix:
+        if quote in new or "\n" in new or "\r" in new or new.endswith("\\"):
+            return None
+        text = new
+    else:
+        text = (new.replace("\\", "\\\\").replace(quote, "\\" + quote)
+                .replace("\n", "\\n").replace("\r", "\\r"))
+    if "f" in prefix:
+        text = text.replace("{", "{{").replace("}", "}}")
+    return text
+
+
 def scan_source(source, rules):
     """Return every Finding in one source string. Raises ScanError.
 
@@ -361,18 +477,22 @@ def _scan_strip(source, rules, strings, comments, place, findings):
             # rename happened. Rewriting it is how sed destroys the only record.
             continue
         lineno, col, context = place(pos)
-        if span_at(strings, pos) is None:
+        span = span_at(strings, pos)
+        if span is None:
             findings.append(Finding(
                 REVIEW, lineno, col, m.group(0), "", context,
                 "outside a string literal, so it is code or documentation "
                 "rather than data"))
+            continue
+        if _in_code_field(source, span, pos):
+            findings.append(Finding(
+                REVIEW, lineno, col, m.group(0), "", context, _FIELD_NOTE))
             continue
         if not _left_boundary(source, pos):
             findings.append(Finding(
                 REVIEW, lineno, col, m.group(0), "", context,
                 "runs on from the word before it, so the left edge is ambiguous"))
             continue
-        span = span_at(strings, pos)
         if _SQL_RE.search(source[span[0]:span[1]]):
             findings.append(Finding(
                 REVIEW, lineno, col, m.group(0), "", context,
@@ -388,11 +508,13 @@ def _scan_strip(source, rules, strings, comments, place, findings):
         pos = m.start()
         if span_at(comments, pos) is not None:
             continue
-        if span_at(strings, pos) is None:
+        span = span_at(strings, pos)
+        if span is None or _in_code_field(source, span, pos):
             # Reached only by code that tokenizes but cannot parse, such as
             # "x = Db.SDE.(1)": the tokenizer never parses, so it lets that
             # through. A line that cannot run names no object to repoint, so
-            # it is left out of the report. The self-test pins this.
+            # it is left out of the report. The self-test pins this. A hit
+            # inside an f-string replacement field is code in the same way.
             continue
         if not _left_boundary(source, pos):
             continue
@@ -420,6 +542,10 @@ def _scan_rename(source, rules, strings, comments, place, findings,
                 "outside a string literal, so it is an identifier or a comment "
                 "and not this tool's to edit"))
             continue
+        if _in_code_field(source, span, pos):
+            findings.append(Finding(
+                REVIEW, lineno, col, m.group(0), "", context, _FIELD_NOTE))
+            continue
         literal = _literal_text(source, span)
         suffix = _matching_suffix(literal, rules.review_suffixes)
         if suffix is not None:
@@ -438,7 +564,17 @@ def _scan_rename(source, rules, strings, comments, place, findings,
                 "part of a longer token, so rewriting it would corrupt the "
                 "rest of that token"))
             continue
-        findings.append(Finding(REPLACE, lineno, col, m.group(0), new, context))
+        fitted = _fit_new(source, span, new)
+        if fitted is None:
+            findings.append(Finding(
+                REVIEW, lineno, col, m.group(0), "", context,
+                "the new value cannot be written inside this literal without "
+                "breaking its quoting or changing its meaning (a quote or line "
+                "break in a raw literal, a trailing backslash in a raw literal, "
+                "or a non-ASCII character in a bytes literal); edit it by hand"))
+            continue
+        findings.append(Finding(REPLACE, lineno, col, m.group(0), fitted,
+                                context))
 
 
 def _matching_suffix(literal, suffixes):
@@ -465,7 +601,9 @@ def apply_findings(source, findings):
     for f in replacements:
         by_line.setdefault(f.lineno, []).append(f)
 
-    lines = source.splitlines(True)
+    # Split on LF only, the same rule the scan counts lines by. str.splitlines
+    # also breaks on a form feed, U+2028 and others, and refused those files.
+    lines = source.split("\n")
     for lineno in sorted(by_line):
         if lineno > len(lines):
             raise ScanError(
@@ -482,7 +620,7 @@ def apply_findings(source, findings):
                     % (f.lineno, f.col, segment, f.before))
             line = line[:start] + f.after + line[start + len(f.before):]
         lines[lineno - 1] = line
-    return "".join(lines)
+    return "\n".join(lines)
 
 
 # ------------------------------------------------------------------ preflight
@@ -669,8 +807,8 @@ def write_atomic(path, data):
     except Exception:
         if handle is not None:
             os.close(handle)
-        # ponytail: the False branch needs os.replace to consume the temporary
-        # file and then raise, which no offline fixture can make happen.
+        # The False branch is a replace that took the temporary file and then
+        # failed; the self-test forces it by swapping os.replace.
         if os.path.exists(temp):
             os.remove(temp)
         raise
@@ -704,8 +842,19 @@ def apply_result(result):
 
     backup = backup_path_for(result.path)
     try:
-        open(backup, "wb").write(result.bom + result.text.encode("utf-8"))
-        result.backup_path = backup
+        # Created owner-only and exclusive, then given the original's mode
+        # before any content goes in. The backup holds the same text as the
+        # script, so it must never be more readable than the script was.
+        handle = os.fdopen(os.open(
+            backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            | getattr(os, "O_BINARY", 0), 0o600), "wb")
+        try:
+            # Set first, so a copy that fails part-way is removed below.
+            result.backup_path = backup
+            shutil.copymode(result.path, backup)
+            handle.write(result.bom + result.text.encode("utf-8"))
+        finally:
+            handle.close()
         write_atomic(result.path, result.bom + new_text.encode("utf-8"))
     except (IOError, OSError) as exc:
         if result.backup_path and os.path.exists(result.backup_path):
@@ -749,30 +898,61 @@ def excluded(rel, patterns):
     return False
 
 
-def discover(paths, extensions, excludes):
-    """Every file under `paths` with a wanted extension and no exclude match."""
-    wanted = tuple((e if e.startswith(".") else "." + e).lower()
-                   for e in extensions)
-    found = []
+def wanted_extensions(extensions):
+    """Extensions in one spelling: lower case, with the leading dot."""
+    return tuple((e if e.startswith(".") else "." + e).lower()
+                 for e in extensions)
+
+
+def excluded_path(full, patterns):
+    """True when a pattern matches the path as typed or any tail of it.
+
+    "scripts/vendor/v.py" is tried as that, then "vendor/v.py", then "v.py". So
+    `vendor/*` excludes the file whether it was reached by a directory walk or
+    named straight on the command line. A pattern that starts at the root of a
+    drive or a file system is tried against the absolute path instead, so the
+    directories above the one you typed never decide a relative pattern.
+    """
+    parts = _posix(full).split("/")
+    tails = ["/".join(parts[i:]) for i in range(len(parts))]
+    absolute = os.path.abspath(full)
+    for pattern in patterns:
+        rooted = _posix(pattern).startswith("/") or re.match(
+            r"[A-Za-z]:/", _posix(pattern)) is not None
+        if any(excluded(s, [pattern]) for s in ([absolute] if rooted else tails)):
+            return True
+    return False
+
+
+def discover(paths, extensions, excludes, errors=None):
+    """Every file under `paths` with a wanted extension and no exclude match.
+
+    A directory the walk cannot read is appended to `errors` as (path, reason),
+    so the caller can report it. os.walk alone would skip it in silence.
+    """
+    wanted = wanted_extensions(extensions)
+    errors = [] if errors is None else errors
+    found = {}
     for path in paths:
         if os.path.isfile(path):
             # A file named on the command line is still subject to --exclude, so
             # pointing straight at an excluded file cannot get it rewritten.
-            if os.path.splitext(path)[1].lower() in wanted and not excluded(
-                    os.path.basename(path), excludes):
-                found.append(path)
+            if (os.path.splitext(path)[1].lower() in wanted
+                    and not excluded_path(path, excludes)):
+                found.setdefault(os.path.normcase(os.path.abspath(path)), path)
             continue
-        for dirpath, dirnames, filenames in os.walk(path):
+        for dirpath, dirnames, filenames in os.walk(
+                path, onerror=lambda exc: errors.append((exc.filename, str(exc)))):
             dirnames[:] = [d for d in dirnames
                            if d not in SKIP_DIRS and not d.startswith(".")]
             for name in filenames:
                 if os.path.splitext(name)[1].lower() not in wanted:
                     continue
                 full = os.path.join(dirpath, name)
-                if excluded(os.path.relpath(full, path), excludes):
+                if excluded_path(full, excludes):
                     continue
-                found.append(full)
-    return sorted(set(found))
+                found.setdefault(os.path.normcase(os.path.abspath(full)), full)
+    return sorted(found.values())
 
 
 # ------------------------------------------------------------------ reporting
@@ -803,10 +983,17 @@ def describe(results, apply_mode):
                 lines.append("           %s" % f.note)
             lines.append("           %s" % f.context)
 
+    # Under --apply a file that errored kept its old text, so its replacements
+    # are counted as not written, never as written.
+    written = sum(r.replace_count for r in results if r.applied)
     lines.append("")
     lines.append("%d replacement(s) %s, %d for review, %d file(s) errored"
-                 % (replaces, "written" if apply_mode else "pending",
+                 % (written if apply_mode else replaces,
+                    "written" if apply_mode else "pending",
                     reviews, len(errors)))
+    if apply_mode and replaces > written:
+        lines.append("%d replacement(s) NOT written. Read the ERROR lines."
+                     % (replaces - written))
     if replaces and not apply_mode:
         lines.append("Nothing was written. Re-run with --apply.")
     if reviews:
@@ -838,6 +1025,13 @@ def describe_preflight(hits, force):
 
 
 # ------------------------------------------------------------------ self-test
+
+def _footer(passed, failed):
+    """The closing lines of a self-test run and its exit code."""
+    lines = ["%d assertions, %d failed" % (passed + len(failed), len(failed))]
+    lines.extend("  FAILED: %s" % label for label in failed)
+    return lines, 1 if failed else 0
+
 
 def self_test():
     """Assertions over the decision core, then over the file layer.
@@ -964,8 +1158,7 @@ def self_test():
           "the context beside a finding is stripped of its indentation")
 
     # The front end tokenizes and never parses, so a Python 2 file is scanned
-    # like any other. Measured on a 743-file legacy tree: 736 files scanned,
-    # 335 of them files that Python 3 refuses to ast.parse.
+    # like any other, including one that Python 3 refuses to ast.parse.
     py2 = 'print "starting"\nsrv = "OLDHOST"\n'
     f = scan_source(py2, host)
     check(kinds(f) == [REPLACE] and f[0].lineno == 2,
@@ -1142,6 +1335,11 @@ def self_test():
     raises(lambda: Rules(renames=[("", "x")]), "an empty old value is refused")
     raises(lambda: Rules(renames=[("a", "a")]),
            "renaming a value to itself is refused")
+    raises(lambda: Rules(renames=[("a", "")]),
+           "renaming a value to nothing is refused, so an unset shell variable "
+           "cannot blank every literal  <-- pinned defect")
+    raises(lambda: Rules(renames=[_rename_pair("OLDHOST=")]),
+           "and so is a --rename that ends at the equals sign")
     raises(lambda: Rules(strip_prefixes=["SCHEMA"]),
            "a strip prefix with nothing to strip is refused")
     raises(lambda: _rename_pair("OLDHOST"),
@@ -1176,15 +1374,132 @@ def self_test():
     raises(lambda: apply_findings('a = "something else entirely"\n', stale),
            "applying a stale finding to moved source raises  <-- pinned defect")
     stale2 = scan_source('a = 1\nb = "Db.SCHEMA.One"\n', strip)
-    raises(lambda: apply_findings("a = 1\n", stale2),
+    raises(lambda: apply_findings("a = 1", stale2),
            "a finding past the end of the source raises  <-- pinned defect")
-    # A CR-only file is the one place where the scanner's idea of a line and
-    # str.splitlines' idea of a line disagree. The column check catches it, so
-    # it refuses instead of writing the replacement into the wrong place.
+    # A CR-only file is a line break to the tokenizer and not to the LF count
+    # the findings use, so the scan refuses it instead of reporting positions
+    # that have drifted.
     cr = 'a = 1\rb = "Db.SCHEMA.One"\r'
     raises(lambda: apply_findings(cr, scan_source(cr, strip)),
            "an old-Mac CR-only file is refused, not written wrong  "
            "<-- pinned defect")
+
+    # ---- a hit on the first column of a later line is on THAT line
+    f = scan_source('a = 1\nOLDHOST = 2\n', host)
+    check((f[0].lineno, f[0].col) == (2, 1),
+          "a hit in column 1 of line 2 is reported on line 2, not as the end "
+          "of line 1  <-- pinned defect")
+
+    # ---- an f-string replacement field is code, not data
+    fsrc = (
+        'a = f"{{OLDHOST}}"\n'
+        'b = f"\\N{DEGREE SIGN} OLDHOST"\n'
+        'c = f"{x:>{OLDHOST}}"\n'
+        'd = rf"\\{OLDHOST}"\n'
+        'e = f"\\\\{OLDHOST}"\n'
+        'g = f"}}OLDHOST{{"\n')
+    f = scan_source(fsrc, host)
+    check([(x.lineno, x.kind) for x in f]
+          == [(1, REPLACE), (2, REPLACE), (3, REVIEW), (4, REVIEW),
+              (5, REVIEW), (6, REPLACE)],
+          "doubled braces and a named escape are data, and a nested field, a "
+          "raw-literal field and a field after an escaped backslash are code  "
+          "<-- pinned defect")
+    check("replacement field" in f[2].note,
+          "and the report says it is an f-string replacement field")
+    src = 'OLDHOST = "OLDHOST"\nconn = f"SERVER={OLDHOST};x=OLDHOST"\n'
+    out = apply_findings(src, scan_source(src, host))
+    check(out == 'OLDHOST = "newhost.example.org"\n'
+                 'conn = f"SERVER={OLDHOST};x=newhost.example.org"\n',
+          "the name inside the braces is left to run, and the text beside it "
+          "is renamed  <-- pinned defect")
+    f = scan_source('fc = f"{Db.SDE.Lookup}"\n', strip)
+    check(kinds(f) == [REVIEW] and "replacement field" in f[0].note,
+          "a qualifier inside a replacement field is reviewed too, never "
+          "stripped  <-- pinned defect")
+    check(scan_source('fc = f"{Db.SDE.}"\n', strip) == [],
+          "and a computed qualifier inside a field is left out like any other "
+          "code that cannot run")
+
+    # ---- the new value is written as source text, so it is escaped for the
+    # literal it lands in
+    def landed(literal, new, as_f=False):
+        text = 'v = %s\n' % literal
+        out = apply_findings(text, scan_source(
+            text, Rules(renames=[("OLDHOST", new)])))
+        expr = out.split("= ", 1)[1]
+        # eval is safe here: expr is a fixture built above from constants, and
+        # an f-string has no literal_eval form.
+        return eval(compile(expr, "<landed>", "eval"), {}) if as_f \
+            else ast.literal_eval(expr)
+
+    cases = [
+        ('"OLDHOST"', 'HOST\\NAMED', False, 'HOST\\NAMED'),
+        ('"OLDHOST"', 'HOST\\test', False, 'HOST\\test'),
+        ("'OLDHOST'", "it's", False, "it's"),
+        ('"OLDHOST"', 'say "hi"', False, 'say "hi"'),
+        ('"""OLDHOST"""', 'say "hi"', False, 'say "hi"'),
+        ('"OLDHOST"', 'a\nb', False, 'a\nb'),
+        ('f"x OLDHOST"', 'a{b}c', True, 'x a{b}c'),
+        ('r"C:\\OLDHOST"', '\\\\srv\\share', False, 'C:\\\\\\srv\\share'),
+    ]
+    bad = [(literal, new) for literal, new, as_f, expected in cases
+           if landed(literal, new, as_f) != expected]
+    check(bad == [],
+          "a new value holding a backslash, either quote, a line break or a "
+          "brace lands as exactly that value in every kind of literal  "
+          "<-- pinned defect")
+    refused = []
+    for literal, new in (('r"OLDHOST"', 'a"b'), ('r"OLDHOST"', 'a\nb'),
+                         ('r"OLDHOST"', 'a\\'), ('b"OLDHOST"', 'caf\u00e9')):
+        text = 'v = %s\n' % literal
+        f = scan_source(text, Rules(renames=[("OLDHOST", new)]))
+        refused.append(kinds(f) == [REVIEW] and "cannot be written" in f[0].note)
+    check(refused == [True] * 4,
+          "and where a literal cannot hold it (a quote or line break in a raw "
+          "literal, a trailing backslash in a raw literal, a non-ASCII "
+          "character in a bytes literal) the hit is reviewed, not written  "
+          "<-- pinned defect")
+
+    # ---- a credential on a hit line never reaches the report
+    cred = 'conn = "SERVER=OLDHOST;UID=gis;PWD=Sup3rSecret99;"\n'
+    f = scan_source(cred, host)
+    check("Sup3rSecret99" not in f[0].context and "PWD=***" in f[0].context,
+          "a PWD value on the line of a hit is masked in the report  "
+          "<-- pinned defect")
+    f = scan_source('u = "OLDHOST"; password = "hunter2pw"\n', host)
+    check("hunter2pw" not in f[0].context,
+          "and so is a quoted password assignment")
+    f = scan_source("u = 'https://svc:Hunter3pw@OLDHOST/x'\n", host)
+    check("Hunter3pw" not in f[0].context and "svc:***@" in f[0].context,
+          "and so is the password in a user:password@host URL")
+    hits = preflight({"a.py": 'c = "newhost.example.org;PWD=zzz999"\n'}, host)
+    check(hits and "zzz999" not in hits[0].context,
+          "the pre-flight echo is masked the same way  <-- pinned defect")
+    out = apply_findings(cred, scan_source(cred, host))
+    check("Sup3rSecret99" in out,
+          "while the file itself keeps its password, because the mask is for "
+          "the report and not for the edit")
+    long_line = 'x = "OLDHOST" + "%s"\n' % ("a" * 300)
+    check(len(scan_source(long_line, host)[0].context) == CONTEXT_WIDTH,
+          "a very long line is cut to the context width  <-- pinned defect")
+
+    # ---- line breaks the tokenizer does not count
+    breaks = []
+    for brk in ("\x0c", "\x0b", "\u2028"):
+        for text in ('# n' + brk + 'x\nsrv = "OLDHOST"\n',
+                     'x = "a' + brk + 'b OLDHOST"\n'):
+            breaks.append(apply_findings(text, scan_source(text, host))
+                          == text.replace("OLDHOST", "newhost.example.org"))
+    check(all(breaks),
+          "a form feed, a vertical tab or U+2028 near a hit no longer makes "
+          "the file unappliable  <-- pinned defect")
+    result = FileResult("x.py")
+    result.text = cr
+    scan_result(result, strip)
+    check("bare CR" in result.error and result.findings == [],
+          "a CR-only file is an ERROR in the scan, so a dry run shows the "
+          "refusal and not a pile of drifted hits  <-- pinned defect")
 
     # ---- the pre-flight
     done = {"a.py": 'fc = "SCHEMA.Parcels"\n'}
@@ -1217,6 +1532,10 @@ def self_test():
           "with the old value still in the tree the same file is only a hint")
     check(preflight({"a.py": 'srv = "other"\n'}, host) == [],
           "a file mentioning neither value raises nothing")
+    check(preflight({"a.py": 'srv = "newhost.example.org"  # was OLDHOST\n'},
+                    host) == [],
+          "a file that still holds the old value beside the new one is not "
+          "evidence that the rename ran")
     many = dict(("f%02d.py" % i, 'srv = "newhost.example.org"\n')
                 for i in range(21))
     report = describe_preflight(preflight(many, host), False)
@@ -1244,6 +1563,21 @@ def self_test():
     check(excluded("vendor/legacy.py", ["vendor\\legacy.py"]),
           "a pattern typed with backslashes matches a path spelled with "
           "slashes  <-- pinned defect")
+    check(excluded_path("scripts/vendor/v.py", ["vendor/*"]),
+          "a path typed with its directory is excluded by a pattern for the "
+          "tail of it  <-- pinned defect")
+    check(excluded_path("scripts/vendor/v.py", ["scripts/vendor/*"]),
+          "and by a pattern that names the directory it was typed with  "
+          "<-- pinned defect")
+    check(not excluded_path("scripts/vendor/v.py", ["other/*"]),
+          "and not by a pattern for somewhere else")
+    here = os.path.abspath("scripts")
+    check(excluded_path("scripts/v.py", [_posix(here) + "/*"]),
+          "a pattern that starts at a drive or a root is tried against the "
+          "absolute path")
+    check(not excluded_path("a/vendor/v.py", ["/vendor/*"]),
+          "and a rooted pattern is not matched against the tail of a "
+          "relative one")
 
     # ---- argument parsing, before anything can be written
     args = _parse(["scripts"])
@@ -1372,6 +1706,8 @@ def self_test():
         check(open(bom, "rb").read()
               == b'\xef\xbb\xbfsrv = "newhost.example.org"\n',
               "a UTF-8 BOM survives the rewrite  <-- pinned defect")
+        check(open(bom + ".bak", "rb").read() == b'\xef\xbb\xbfsrv = "OLDHOST"\n',
+              "and the backup of that file keeps the BOM too")
         check(open(bad, "rb").read() == b'srv = "OLDHOST \xff\xfe"\n',
               "the file that could not be decoded was not touched")
         check(open(broken, "rb").read() == b'sql = """unterminated\n',
@@ -1389,21 +1725,43 @@ def self_test():
         check(open(result.backup_path, "rb").read() == b'srv = "OLDHOST"\n',
               "and the second backup holds the second original")
 
-        # two backups inside the same second, so the timestamp alone collides
+        # two backups inside the same second, so the timestamp alone collides.
+        # The clock is frozen, so the collision is certain and not luck.
         stamped = write("stamped.py", b'srv = "OLDHOST"\n')
         open(stamped + ".bak", "wb").close()
-        nxt = ""
-        # ponytail: the retry and the loop running out are taken only when the
-        # clock ticks over a second mid-loop, so a run covers them by chance.
-        for _ in range(3):
-            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            open("%s.%s.bak" % (stamped, stamp), "wb").close()
-            nxt = backup_path_for(stamped)
-            if nxt.startswith("%s.%s-" % (stamped, stamp)):
-                break
-        check(nxt == "%s.%s-1.bak" % (stamped, stamp),
+        real_datetime = datetime
+
+        class _Frozen(object):
+            @staticmethod
+            def now():
+                return real_datetime(2026, 1, 2, 3, 4, 5)
+
+        globals()["datetime"] = _Frozen
+        try:
+            names = []
+            for _ in range(3):
+                names.append(backup_path_for(stamped))
+                open(names[-1], "wb").close()
+        finally:
+            globals()["datetime"] = real_datetime
+        stamp = "20260102-030405"
+        check(names[0] == "%s.%s.bak" % (stamped, stamp),
+              "a second backup gets a timestamped name")
+        check(names[1] == "%s.%s-1.bak" % (stamped, stamp),
               "a third backup inside the same second gets a counter rather "
               "than overwriting the second  <-- pinned defect")
+        check(names[2] == "%s.%s-2.bak" % (stamped, stamp),
+              "and a fourth keeps counting")
+
+        # the backup of a script is no more readable than the script was
+        moded = write("moded.py", b'srv = "OLDHOST"\n')
+        os.chmod(moded, 0o640)
+        result = apply_result(scan_result(read_file(moded), host))
+        check(result.applied and (os.stat(result.backup_path).st_mode & 0o777)
+              == (os.stat(moded).st_mode & 0o777),
+              "a backup carries exactly the mode of the file it protects, so a "
+              "script kept private does not get a more readable copy  "
+              "<-- pinned defect")
 
         # the backup goes first, so a backup that cannot be written stops the
         # rewrite instead of following it
@@ -1480,6 +1838,19 @@ def self_test():
               == b'srv = "OLDHOST"  # edited by somebody else\n',
               "and the other edit survives")
 
+        # only a byte-order mark arriving in between is still a change
+        handle = open(locked, "wb")
+        handle.write(b'srv = "OLDHOST"\n')
+        handle.close()
+        moved = scan_result(read_file(locked), host)
+        handle = open(locked, "wb")
+        handle.write(b'\xef\xbb\xbfsrv = "OLDHOST"\n')
+        handle.close()
+        apply_result(moved)
+        check("changed on disk" in moved.error and not moved.applied,
+              "a byte-order mark added after the scan counts as an edit, so "
+              "the write is refused  <-- pinned defect")
+
         # the atomic write, when the replace itself cannot happen
         scratch = os.path.join(tmp, "scratch")
         os.makedirs(scratch)
@@ -1505,6 +1876,25 @@ def self_test():
         check(sorted(os.listdir(tmp)) == before_names,
               "and takes its temporary file with it  <-- pinned defect")
 
+        # a replace that consumes the temporary file and then fails leaves
+        # nothing of it to clean up
+        def _consume(src, _dst):
+            os.remove(src)
+            raise OSError("gone")
+
+        held_replace = os.replace
+        os.replace = _consume
+        raised = []
+        try:
+            write_atomic(good, b"data")
+        except OSError:
+            raised.append(True)
+        finally:
+            os.replace = held_replace
+        check(raised == [True] and sorted(os.listdir(tmp)) == before_names,
+              "a replace that fails after taking the temporary file is "
+              "reported and leaves nothing behind")
+
         # the pre-flight over a tree that has already been converted
         done_dir = os.path.join(tmp, "done")
         write("done/a.py", b'srv = "newhost.example.org"\n')
@@ -1527,6 +1917,14 @@ def self_test():
         check("weak hint" in out and "Refusing" not in out,
               "a weak hint warns and carries on, so nobody reaches for --force "
               "by habit  <-- pinned defect")
+        code, out = capture(lambda: main([done_dir, "--rename",
+                                          "OLDHOST=newhost.example.org",
+                                          "--apply"]))
+        check("weak hint" in out and code == 0 and open(
+            os.path.join(done_dir, "b.py"), "rb").read()
+            == b'srv = "newhost.example.org"\n',
+              "and with --apply the weak hint still lets the write through  "
+              "<-- pinned defect")
 
         # --force over a tree that still has real work in it, so the switch is
         # measured by what reaches the disk and not only by what it prints
@@ -1550,8 +1948,9 @@ def self_test():
         ext_file = write("extonly/a.txt", b'srv = "OLDHOST"\n')
         code, out = capture(lambda: main([ext_dir, "--rename",
                                           "OLDHOST=newhost.example.org"]))
-        check(code == 0 and "no files" in out,
-              "a .txt is not scanned by default")
+        check(code == 64 and "no files" in out,
+              "a directory holding only a .txt scans nothing, and that is a "
+              "usage error and not a clean pass  <-- pinned defect")
         code, out = capture(lambda: main([ext_dir, "--rename",
                                           "OLDHOST=newhost.example.org",
                                           "--ext", "txt", "--apply"]))
@@ -1593,6 +1992,101 @@ def self_test():
               "the report on a drive-letter literal gives a rename decision "
               "and no path verdict at all  <-- pinned defect")
 
+        # the summary counts what reached the disk, not what was found
+        fail_dir = os.path.join(tmp, "failwrite")
+        failing = write("failwrite/a.py", b'srv = "OLDHOST"\n')
+        held_write = globals()["write_atomic"]
+        globals()["write_atomic"] = _boom
+        try:
+            code, out = capture(lambda: main([fail_dir, "--rename",
+                                              "OLDHOST=newhost.example.org",
+                                              "--apply"]))
+        finally:
+            globals()["write_atomic"] = held_write
+        check(code == 1 and "0 replacement(s) written" in out
+              and "1 replacement(s) NOT written" in out
+              and open(failing, "rb").read() == b'srv = "OLDHOST"\n',
+              "a file that could not be written is not counted as written  "
+              "<-- pinned defect")
+
+        # a file with only REVIEW items is neither backed up nor rewritten
+        review_dir = os.path.join(tmp, "reviewonly")
+        review_file = write("reviewonly/a.py", b'OLDHOST = 1\n')
+        code, out = capture(lambda: main([review_dir, "--rename",
+                                          "OLDHOST=newhost.example.org",
+                                          "--apply"]))
+        check(code == 1 and not os.path.exists(review_file + ".bak")
+              and open(review_file, "rb").read() == b'OLDHOST = 1\n',
+              "--apply over a file that holds only review items writes no "
+              "backup and no file  <-- pinned defect")
+
+        # an old value that reaches the report in a form the console cannot show
+        arrow_dir = os.path.join(tmp, "arrow")
+        arrow = write("arrow/u.py",
+                      u'x = "OLDHOST"  # \u2192 prod\n'.encode("utf-8"))
+        wrapper = io.TextIOWrapper(io.BytesIO(), encoding="cp1252",
+                                   errors="strict")
+        held_streams = sys.stdout, sys.stderr
+        sys.stdout = sys.stderr = wrapper
+        try:
+            # A regression raises UnicodeEncodeError here, which ends the run.
+            code = main([arrow_dir, "--rename", "OLDHOST=newhost.example.org",
+                         "--apply"])
+        finally:
+            sys.stdout, sys.stderr = held_streams
+        wrapper.flush()
+        check(code == 0
+              and b"\\u2192" in wrapper.buffer.getvalue()
+              and open(arrow, "rb").read()
+              == u'x = "newhost.example.org"  # \u2192 prod\n'.encode("utf-8"),
+              "a character the console cannot encode prints as an escape and "
+              "does not end the report after the files were written  "
+              "<-- pinned defect")
+
+        # a named file whose extension is not scanned is an error, not a pass
+        code, out = capture(lambda: main([notes, "--rename",
+                                          "OLDHOST=newhost.example.org"]))
+        check(code == 64 and "not a scanned extension" in out
+              and open(notes, "rb").read() == b'srv = "OLDHOST"\n',
+              "a named file with an unscanned extension exits 64 and says "
+              "how to scan it  <-- pinned defect")
+
+        # a directory the walk could not read is an error in the report
+        held_discover = globals()["discover"]
+        globals()["discover"] = lambda paths, ext, ex, errs: (
+            errs.append((os.path.join(tmp, "locked"), "Permission denied")),
+            [])[1]
+        try:
+            code, out = capture(lambda: main([tmp, "--rename",
+                                              "OLDHOST=newhost.example.org"]))
+        finally:
+            globals()["discover"] = held_discover
+        check(code == 1 and "directory not read" in out
+              and "Permission denied" in out,
+              "a directory the walk could not read is an ERROR line and exit "
+              "1, not a silent skip  <-- pinned defect")
+        walk_errors = []
+        check(discover([os.path.join(tmp, "nope")], DEFAULT_EXTENSIONS, [],
+                       walk_errors) == [] and len(walk_errors) == 1,
+              "and discover itself records the directory it could not read")
+        upper_dir = os.path.join(tmp, "upper")
+        upper = write("upper/A.PY", b'srv = "OLDHOST"\n')
+        check([os.path.normcase(p) for p in discover(
+                  [upper_dir], DEFAULT_EXTENSIONS, [])]
+              == [os.path.normcase(upper)],
+              "an upper-case extension is still a Python file")
+        check(discover([good, os.path.join(tmp, ".", "good.py")],
+                       DEFAULT_EXTENSIONS, []) == [good],
+              "the same file named by two spellings is scanned once  "
+              "<-- pinned defect")
+        check(discover([skipped], DEFAULT_EXTENSIONS, ["vendor/*"]) == [],
+              "an --exclude written for the tail of a path stops a file named "
+              "straight on the command line  <-- pinned defect")
+        walked = discover([tmp], DEFAULT_EXTENSIONS, [_posix(tmp) + "/vendor/*"])
+        check(skipped not in walked and good in walked,
+              "and so does one written as an absolute path, which leaves the "
+              "rest of the walk alone")
+
         # the strip rule end to end
         strip_dir = os.path.join(tmp, "strip")
         target = write("strip/a.py",
@@ -1625,25 +2119,28 @@ def self_test():
         empty = os.path.join(tmp, "empty")
         os.makedirs(empty)
         code, out = capture(lambda: main([empty, "--rename", "A=B"]))
-        check(code == 0 and "no files" in out,
-              "a directory with no Python in it exits 0 and says so")
+        check(code == 64 and "no files" in out,
+              "a directory with no Python in it exits 64 and says so, so a gate "
+              "pointed at the wrong place does not stay green  <-- pinned defect")
 
-        # the harness itself
+        # the harness itself. The probes run with their output captured, so a
+        # green run prints no FAIL line for a CI grep to trip on.
         mark = len(failed)
-        check(False, "a deliberately failing assertion")
+        capture(lambda: check(False, "a deliberately failing assertion"))
         probe = failed[mark:]
         del failed[mark:]
         check(probe == ["a deliberately failing assertion"],
               "check() really does record a failure  <-- pinned defect")
         mark = len(failed)
-        raises(lambda: None, "a call that does not raise")
+        capture(lambda: raises(lambda: None, "a call that does not raise"))
         probe = failed[mark:]
         del failed[mark:]
         check(probe == ["a call that does not raise (no error raised)"],
               "raises() really does record a call that did not raise  "
               "<-- pinned defect")
         mark = len(failed)
-        raises(lambda: 1 // 0, "a call that raises the wrong thing")
+        capture(lambda: raises(lambda: 1 // 0,
+                               "a call that raises the wrong thing"))
         probe = failed[mark:]
         del failed[mark:]
         check(len(probe) == 1 and "wrong exception" in probe[0],
@@ -1653,18 +2150,28 @@ def self_test():
         shutil.rmtree(tmp, ignore_errors=True)
     check(not os.path.isdir(tmp),
           "the self-test leaves no temporary directory behind  <-- pinned defect")
+    check(_footer(3, []) == (["3 assertions, 0 failed"], 0),
+          "a green run ends with the count and exit code 0")
+    check(_footer(2, ["x"]) == (["3 assertions, 1 failed", "  FAILED: x"], 1),
+          "and a red run names each failed label and exits 1, so the red path "
+          "is exercised and not only described  <-- pinned defect")
+    held_argv = list(sys.argv)
+    noisy = io.StringIO()
+    sys.stdout, held_out = noisy, sys.stdout
+    try:
+        module = runpy.run_path(os.path.abspath(__file__),
+                                run_name="litswap_imported")
+    finally:
+        sys.stdout = held_out
+    check(noisy.getvalue() == "" and "main" in module and sys.argv == held_argv,
+          "importing the module runs nothing and prints nothing  "
+          "<-- pinned defect")
 
     print("-" * 68)
-    total = passed[0] + len(failed)
-    # ponytail: this branch runs only on a red self-test, so a green coverage
-    # run cannot reach it. The harness probes above prove failures are recorded.
-    if failed:
-        print("%d assertions, %d failed" % (total, len(failed)))
-        for label in failed:
-            print("  FAILED: %s" % label)
-        return 1
-    print("%d assertions, 0 failed" % total)
-    return 0
+    lines, code = _footer(passed[0], failed)
+    for line in lines:
+        print(line)
+    return code
 
 
 # ------------------------------------------------------------------------ cli
@@ -1720,7 +2227,21 @@ def _parse(argv):
     return args
 
 
+def _tolerant(stream):
+    """Make a text stream print any character instead of raising.
+
+    The report echoes source lines, and a redirected Windows stdout is cp1252,
+    so one arrow or accented letter in a comment would raise mid-report, after
+    --apply had already written the files. A character the stream cannot hold
+    prints as a backslash escape instead.
+    """
+    if hasattr(stream, "reconfigure"):
+        stream.reconfigure(errors="backslashreplace")
+
+
 def main(argv=None):
+    _tolerant(sys.stdout)
+    _tolerant(sys.stderr)
     args = _parse(sys.argv[1:] if argv is None else argv)
 
     if args.self_test:
@@ -1741,10 +2262,24 @@ def main(argv=None):
         print("error: %s" % exc, file=sys.stderr)
         return 64
 
-    files = discover(args.paths, args.ext, args.exclude)
-    if not files:
-        print("litswap: no files to scan under %s" % ", ".join(args.paths))
-        return 0
+    wanted = wanted_extensions(args.ext)
+    unscanned = [p for p in args.paths if os.path.isfile(p)
+                 and os.path.splitext(p)[1].lower() not in wanted]
+    if unscanned:
+        # A named file the walk would skip leaves a gate green with the old
+        # value still in it. Say so, and let the caller add --ext.
+        print("error: not a scanned extension (%s): %s. Add --ext to scan it."
+              % (", ".join(wanted), ", ".join(unscanned)), file=sys.stderr)
+        return 64
+
+    walk_errors = []
+    files = discover(args.paths, args.ext, args.exclude, walk_errors)
+    if not files and not walk_errors:
+        # Nothing scanned is not nothing found: a mistyped path, an unmounted
+        # share or a bad --exclude all end up here, and none may pass a gate.
+        print("error: no files to scan under %s" % ", ".join(args.paths),
+              file=sys.stderr)
+        return 64
 
     results = [read_file(path) for path in files]
     readable = dict((r.path, r.text) for r in results if r.text is not None)
@@ -1764,6 +2299,10 @@ def main(argv=None):
 
     print("")
     print("litswap: %d file(s) scanned" % len(results))
+    for path, reason in walk_errors:
+        failed_dir = FileResult(path)
+        failed_dir.error = "directory not read, so its files were not scanned: %s" % reason
+        results.append(failed_dir)
     for line in describe(results, args.apply):
         print(line)
 
@@ -1779,6 +2318,6 @@ def main(argv=None):
     return 0
 
 
-# ponytail: the False branch is an import, and the coverage run is a script run.
+# The False branch is an import; the self-test takes it with runpy.
 if __name__ == "__main__":
     sys.exit(main())
